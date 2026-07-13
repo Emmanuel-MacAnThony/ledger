@@ -38,9 +38,10 @@ class CreatePayment:
 
     def _handle_existing(self, existing: IdempotencyKey, inp: CreatePaymentInput,
                          request_hash: str, now) -> CreatePaymentResult:
-        # Expiry FIRST: an expired key reclaims as a new payment regardless of body,
-        # so the fingerprint check must not run on it (get() returns expired rows too).
-        if existing.is_expired(now, self._config.key_ttl):
+        # Expiry reclaim is TERMINAL-only. An in-flight key that's aged past the
+        # window must NOT be recycled — its original charge may still be outstanding,
+        # so it falls through to the in-flight branch (resolve via re-drive) instead.
+        if existing.is_terminal() and existing.is_expired(now, self._config.key_ttl):
             return self._start(inp, request_hash, now, reclaim=True)   # new generation
         # Live key: same key must mean the same operation. Different body -> 409.
         if request_hash != existing.request_hash:

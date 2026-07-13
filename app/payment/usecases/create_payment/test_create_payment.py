@@ -352,6 +352,24 @@ def test_expired_key_reclaims_new_payment_old_untouched():
     assert store.keys["abc"].payment_id != "pay_old"     # key now points at the new payment
 
 
+def test_expired_in_flight_key_is_not_reclaimed():
+    # An in-flight key older than 24h must NOT be reclaimed — its original charge may
+    # still be outstanding, so recycling it risks orphaning money / double-charging.
+    # It's resolved via the in-flight path (stale -> re-drive), never recycled.
+    _, store, processor = build(ChargeOutcome.SUCCESS, now=T0)
+    seed_in_flight(store, key="abc", started_at=T0 - timedelta(hours=25))  # expired AND stale
+    processor.charge("pk_seed", 1000, "USD", "user_1")     # the original charge that landed
+    assert processor.real_charges == 1
+
+    usecase, _, _ = build(now=T0, store=store, processor=processor)
+    result = usecase.execute(an_input(key="abc"))
+
+    assert result.is_ok
+    assert len(store.payments) == 1                        # NOT reclaimed — no new payment
+    assert processor.real_charges == 1                     # dedup: re-drove the same charge
+    assert store.keys["abc"].state == KeyState.SUCCEEDED   # resolved, not recycled
+
+
 def test_terminal_write_failure_returns_internal_and_leaves_in_flight():
     store = Store()
     processor = FakeProcessor(ChargeOutcome.SUCCESS)
