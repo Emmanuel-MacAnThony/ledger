@@ -1,0 +1,42 @@
+"""Composition root — build config + infra once, wire the factory into handlers,
+register routes. Nothing deep in the code opens connections or reads env itself."""
+
+import os
+
+from fastapi import FastAPI
+from psycopg import Connection
+
+from app.api.handlers.payment_handler import PaymentHandler, PaymentHandlerDeps
+from app.api.router import RouterDeps, register_routes
+from app.config import Config
+from app.db.connection import create_pool
+from app.payment.infra.clock import SystemClock
+from app.payment.infra.idgen import UuidGen
+from app.payment.infra.processor_client import HttpProcessorClient
+from app.payment.infra.unit_of_work import PostgresUnitOfWork
+from app.payment.usecases.create_payment.service import CreatePayment
+
+
+def create_app() -> FastAPI:
+    dsn = os.getenv("DATABASE_URL", "postgres://ledger:ledger@localhost:5432/ledger")
+    processor_url = os.getenv("PROCESSOR_URL", "http://localhost:9000")
+
+    config = Config.from_env()
+    pool = create_pool(dsn)
+    clock, idgen = SystemClock(), UuidGen()
+    processor = HttpProcessorClient(processor_url)
+
+    # The per-request use case: bind a request-scoped connection to the singletons.
+    def make_create_payment(conn: Connection) -> CreatePayment:
+        return CreatePayment(PostgresUnitOfWork(conn), processor, clock, idgen, config)
+
+    app = FastAPI(title="ledger")
+    register_routes(app, RouterDeps(
+        payment=PaymentHandler(PaymentHandlerDeps(
+            pool=pool, make_create_payment=make_create_payment,
+        )),
+    ))
+    return app
+
+
+app = create_app()
