@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Ledger — idempotency console</title>
+<style>
+  :root {
+    --bg:#09090b; --panel:#111113; --border:#1f1f23; --border2:#27272a;
+    --text:#e4e4e7; --muted:#71717a; --dim:#3f3f46;
+    --indigo:#6366f1; --indigo-dim:rgba(99,102,241,.12);
+    --green:#4ade80; --amber:#f59e0b; --red:#f87171;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+  }
+  * { box-sizing:border-box; }
+  body {
+    margin:0; background:var(--bg); color:var(--text);
+    font-family:var(--mono); font-size:13px; line-height:1.5;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap { max-width:980px; margin:0 auto; padding:40px 24px 80px; }
+  header { margin-bottom:32px; }
+  h1 { font-size:18px; margin:0; letter-spacing:.5px; }
+  h1 .dot { color:var(--indigo); }
+  .sub { color:var(--muted); margin-top:6px; font-size:12px; }
+  .grid { display:grid; grid-template-columns:1fr; gap:20px; }
+  @media (min-width:820px){ .grid { grid-template-columns:1fr 1fr; } }
+  .card {
+    background:var(--panel); border:1px solid var(--border);
+    border-radius:10px; padding:20px;
+  }
+  .card h2 { font-size:12px; text-transform:uppercase; letter-spacing:1.5px;
+    color:var(--muted); margin:0 0 16px; font-weight:600; }
+  label { display:block; color:var(--muted); font-size:11px; margin:12px 0 4px;
+    text-transform:uppercase; letter-spacing:.5px; }
+  input {
+    width:100%; background:var(--bg); border:1px solid var(--border2);
+    border-radius:6px; color:var(--text); font-family:var(--mono);
+    font-size:13px; padding:8px 10px; outline:none;
+  }
+  input:focus { border-color:var(--indigo); }
+  .row { display:flex; gap:12px; }
+  .row > div { flex:1; }
+  button {
+    margin-top:16px; width:100%; background:var(--indigo); color:#fff; border:0;
+    border-radius:6px; font-family:var(--mono); font-size:13px; font-weight:600;
+    padding:10px; cursor:pointer; transition:opacity .15s;
+  }
+  button:hover { opacity:.9; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .headline { font-size:22px; margin:20px 0 4px; }
+  .headline b { color:var(--indigo); }
+  .headline .one { color:var(--green); }
+  .muted { color:var(--muted); }
+  .keyline { font-size:11px; color:var(--dim); word-break:break-all; margin-bottom:8px; }
+  .rows { margin-top:14px; display:flex; flex-direction:column; gap:4px;
+    max-height:220px; overflow:auto; }
+  .rrow { display:flex; align-items:center; gap:10px; font-size:12px;
+    padding:5px 8px; border:1px solid var(--border); border-radius:5px; }
+  .badge { font-size:10px; font-weight:700; padding:2px 7px; border-radius:4px; }
+  .b200 { color:var(--green); background:rgba(74,222,128,.1); }
+  .b409 { color:var(--amber); background:rgba(245,158,11,.1); }
+  .b4xx,.b5xx { color:var(--red); background:rgba(248,113,113,.1); }
+  .pid { color:var(--dim); font-size:11px; }
+  .kv { display:flex; padding:6px 0; border-bottom:1px solid var(--border); }
+  .kv:last-child { border-bottom:0; }
+  .kv .k { color:var(--muted); width:120px; flex-shrink:0; font-size:11px;
+    text-transform:uppercase; letter-spacing:.5px; }
+  .kv .v { color:var(--text); word-break:break-all; }
+  .state { font-weight:700; }
+  .s-succeeded { color:var(--green); } .s-failed { color:var(--red); }
+  .s-in_flight { color:var(--amber); }
+  .err { color:var(--red); margin-top:12px; font-size:12px; }
+  .placeholder { color:var(--dim); font-size:12px; margin-top:14px; }
+  code { color:var(--indigo); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>ledger<span class="dot"> · idempotency console</span></h1>
+    <div class="sub">fire concurrent requests with the same key, watch them collapse to one payment.</div>
+  </header>
+
+  <div class="grid">
+    <!-- Panel 1: the demo -->
+    <div class="card">
+      <h2>Fire concurrent requests</h2>
+      <div class="row">
+        <div><label>amount (cents)</label><input id="amount" value="1000" /></div>
+        <div><label>user id</label><input id="user" value="user_1" /></div>
+        <div><label>concurrent</label><input id="n" value="10" /></div>
+      </div>
+      <button id="fire">Fire N requests with ONE key</button>
+      <div id="demoOut"><div class="placeholder">All N fire at the same instant, same <code>Idempotency-Key</code>.</div></div>
+    </div>
+
+    <!-- Panel 2: the inspector -->
+    <div class="card">
+      <h2>Inspect key</h2>
+      <label>idempotency key</label>
+      <input id="inspectKey" placeholder="paste a key (the demo fills this in)" />
+      <button id="inspect">Inspect</button>
+      <div id="inspectOut"><div class="placeholder">The key's stored state and its payment.</div></div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+
+async function fire() {
+  const amount = parseInt($('amount').value, 10);
+  const user_id = $('user').value.trim();
+  const n = Math.max(1, parseInt($('n').value, 10) || 1);
+  const key = crypto.randomUUID();
+  const body = JSON.stringify({ amount, currency: 'USD', user_id });
+
+  $('fire').disabled = true;
+  $('demoOut').innerHTML = '<div class="placeholder">firing ' + n + ' requests…</div>';
+
+  const reqs = Array.from({ length: n }, () =>
+    fetch('/payments', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Idempotency-Key': key },
+      body,
+    }).then(async r => ({ status: r.status, data: (await r.json()).data }))
+      .catch(() => ({ status: 0, data: null }))
+  );
+  const results = await Promise.all(reqs);
+  $('fire').disabled = false;
+
+  const ids = [...new Set(results.map(r => r.data && r.data.payment_id).filter(Boolean))];
+  const rows = results.map((r, i) => {
+    const cls = r.status === 200 ? 'b200' : r.status === 409 ? 'b409'
+             : r.status >= 500 ? 'b5xx' : 'b4xx';
+    const pid = r.data && r.data.payment_id ? r.data.payment_id.slice(0, 18) + '…' : '—';
+    return '<div class="rrow"><span class="badge ' + cls + '">' + (r.status || 'ERR') +
+           '</span><span class="muted">#' + (i + 1) + '</span><span class="pid">' + pid + '</span></div>';
+  }).join('');
+
+  const paymentWord = ids.length === 1 ? 'payment' : 'payments';
+  $('demoOut').innerHTML =
+    '<div class="headline"><b>' + n + '</b> requests → <span class="one">' + ids.length + '</span> ' + paymentWord + '</div>' +
+    '<div class="keyline">key ' + key + '</div>' +
+    '<div class="rows">' + rows + '</div>';
+
+  $('inspectKey').value = key;
+  inspect();
+}
+
+async function inspect() {
+  const key = $('inspectKey').value.trim();
+  if (!key) return;
+  $('inspectOut').innerHTML = '<div class="placeholder">loading…</div>';
+  const r = await fetch('/admin/keys/' + encodeURIComponent(key));
+  const j = await r.json();
+  if (!r.ok) {
+    $('inspectOut').innerHTML = '<div class="err">' + (j.error ? j.error.message : r.status) + '</div>';
+    return;
+  }
+  const d = j.data;
+  const p = d.payment;
+  const kv = (k, v) => '<div class="kv"><div class="k">' + k + '</div><div class="v">' + v + '</div></div>';
+  let html =
+    kv('state', '<span class="state s-' + d.state + '">' + d.state + '</span>') +
+    kv('key', d.key) +
+    kv('created', new Date(d.created_at).toLocaleString());
+  if (p) {
+    html += kv('payment', p.id) +
+      kv('status', '<span class="state s-' + p.status + '">' + p.status + '</span>') +
+      kv('amount', p.amount + ' ' + p.currency) +
+      kv('user', p.user_id) +
+      kv('processor key', p.processor_key);
+  } else {
+    html += kv('payment', '<span class="muted">none</span>');
+  }
+  $('inspectOut').innerHTML = html;
+}
+
+$('fire').addEventListener('click', fire);
+$('inspect').addEventListener('click', inspect);
+</script>
+</body>
+</html>

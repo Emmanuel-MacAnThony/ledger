@@ -2,8 +2,10 @@
 register routes. Nothing deep in the code opens connections or reads env itself."""
 
 import os
+from pathlib import Path
 
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from psycopg import Connection
 
 from app.api.handlers.admin_handler import AdminHandler, AdminHandlerDeps
@@ -45,6 +47,16 @@ def create_app() -> FastAPI:
         return InspectKey(PostgresKeysRepo(conn), PostgresPaymentsRepo(conn))
 
     app = FastAPI(title="ledger")
+
+    # Idempotency console — a single self-contained page served same-origin as the
+    # API so the concurrency demo can hit /payments with no CORS. Read per request
+    # so the HTML can be edited without restarting the app.
+    web_index = Path(__file__).resolve().parent.parent / "web" / "index.html"
+
+    @app.get("/", include_in_schema=False)
+    def dashboard() -> HTMLResponse:
+        return HTMLResponse(web_index.read_text())
+
     register_routes(app, RouterDeps(
         payment=PaymentHandler(PaymentHandlerDeps(
             pool=pool,
