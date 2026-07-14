@@ -16,6 +16,7 @@ from app.payment.infra.processor_client import HttpProcessorClient
 from app.payment.infra.repositories.payments_repo import PostgresPaymentsRepo
 from app.payment.infra.unit_of_work import PostgresUnitOfWork
 from app.payment.usecases.create_payment.service import CreatePayment
+from app.payment.usecases.drive_payment.service import DrivePayment
 from app.payment.usecases.get_payment.service import GetPayment
 
 
@@ -30,7 +31,9 @@ def create_app() -> FastAPI:
 
     # Per-request use cases: bind a request-scoped connection to the singletons.
     def make_create_payment(conn: Connection) -> CreatePayment:
-        return CreatePayment(PostgresUnitOfWork(conn), processor, clock, idgen, config)
+        uow = PostgresUnitOfWork(conn)                 # shared by the claim + the driver
+        driver = DrivePayment(uow, processor)
+        return CreatePayment(uow, driver, clock, idgen, config)
 
     def make_get_payment(conn: Connection) -> GetPayment:
         return GetPayment(PostgresPaymentsRepo(conn))

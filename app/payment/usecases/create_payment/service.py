@@ -2,13 +2,14 @@ from app.config import Config
 from app.payment.domain.entities.idempotency_key import IdempotencyKey
 from app.payment.domain.entities.payment import Payment
 from app.payment.domain.fingerprint import fingerprint
-from app.payment.domain.states import ChargeOutcome, KeyState, PaymentStatus
+from app.payment.domain.states import KeyState, PaymentStatus
 from app.payment.usecases.create_payment.dtos import CreatePaymentInput, PaymentResult
+from app.payment.usecases.drive_payment.dtos import DriveOutcome, DrivePaymentInput
 from app.payment.usecases.create_payment.errors import (
     CreatePaymentError, Internal, KeyReused, MissingIdempotencyKey, PaymentInProgress,
 )
 from app.payment.usecases.create_payment.interfaces import (
-    Clock, IdGen, ProcessorClient, UnitOfWork,
+    Clock, IdGen, PaymentDriver, UnitOfWork,
 )
 from app.shared.result import Result
 
@@ -17,10 +18,10 @@ CreatePaymentResult = Result[PaymentResult, CreatePaymentError]
 
 
 class CreatePayment:
-    def __init__(self, uow: UnitOfWork, processor: ProcessorClient,
+    def __init__(self, uow: UnitOfWork, driver: PaymentDriver,
                  clock: Clock, idgen: IdGen, config: Config):
         self._uow = uow
-        self._processor = processor
+        self._driver = driver
         self._clock = clock
         self._idgen = idgen
         self._config = config
@@ -92,37 +93,19 @@ class CreatePayment:
         return self._drive(inp.idempotency_key, payment)
 
     def _drive(self, key_str: str, payment: Payment) -> CreatePaymentResult:
-        # Charge with the payment's OWN processor_key — stable across re-drives, so
-        # the processor dedups and a stuck payment finishes with exactly one charge.
-        # Shared by the first attempt and by re-drive of a stale in-flight payment.
-        outcome = self._processor.charge(
-            payment.processor_key, payment.amount, payment.currency, payment.user_id)
+        # Shared drive: idempotent charge + atomic terminal. Map its neutral outcome
+        # to this use case's client-facing Result.
+        result = self._driver.execute(
+            DrivePaymentInput(key=key_str, payment=payment))
 
-        # UNKNOWN: retries exhausted, outcome undecided. Do NOT fabricate a terminal
-        # state — leave the key IN_FLIGHT and let recovery/reconciliation resolve it.
-        if outcome is ChargeOutcome.UNKNOWN:
-            return Result.err(PaymentInProgress())
+        if result.outcome is DriveOutcome.UNRESOLVED:
+            return Result.err(PaymentInProgress())    # charge undecided -> come back
+        if result.outcome is DriveOutcome.INTERNAL:
+            return Result.err(Internal())             # terminal write failed
 
-        if outcome is ChargeOutcome.SUCCESS:
-            key_state, status = KeyState.SUCCEEDED, PaymentStatus.SUCCEEDED
-        else:  # DECLINED — a definite "no"
-            key_state, status = KeyState.FAILED, PaymentStatus.FAILED
-
-        # The terminal write is one transaction — key state + payment status land
-        # together or not at all. If the commit fails, nothing applies (the key
-        # stays IN_FLIGHT, recoverable) and we surface an observable Internal error
-        # rather than letting the infra exception escape.
-        try:
-            with self._uow as uow:
-                uow.keys.set_terminal(key_str, key_state)
-                uow.payments.set_status(payment.id, status)
-                uow.commit()
-        except Exception:
-            return Result.err(Internal())
-
-        return Result.ok(PaymentResult(
+        return Result.ok(PaymentResult(               # SETTLED
             payment_id=payment.id,
-            status=status,
+            status=result.status,
             amount=payment.amount,
             currency=payment.currency,
             user_id=payment.user_id,

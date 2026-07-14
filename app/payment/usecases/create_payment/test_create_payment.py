@@ -24,6 +24,7 @@ from app.payment.domain.fingerprint import fingerprint
 from app.payment.domain.states import ChargeOutcome, ClaimOutcome, KeyState, PaymentStatus
 from app.payment.usecases.create_payment.service import CreatePayment
 from app.payment.usecases.create_payment.dtos import CreatePaymentInput
+from app.payment.usecases.drive_payment.service import DrivePayment
 from app.payment.usecases.create_payment.errors import (
     Internal, KeyReused, MissingIdempotencyKey, PaymentInProgress,
 )
@@ -179,7 +180,9 @@ def build(processor_outcome=ChargeOutcome.SUCCESS, now=T0, store=None, processor
     store = store if store is not None else Store()
     processor = processor if processor is not None else FakeProcessor(processor_outcome)
     config = config if config is not None else Config()
-    usecase = CreatePayment(FakeUnitOfWork(store), processor, FakeClock(now), FakeIdGen(), config)
+    uow = FakeUnitOfWork(store)
+    driver = DrivePayment(uow, processor)             # shares the same uow as the claim
+    usecase = CreatePayment(uow, driver, FakeClock(now), FakeIdGen(), config)
     return usecase, store, processor
 
 
@@ -374,7 +377,8 @@ def test_terminal_write_failure_returns_internal_and_leaves_in_flight():
     store = Store()
     processor = FakeProcessor(ChargeOutcome.SUCCESS)
     uow = FakeUnitOfWork(store, fail_on_commit=2)     # fail the terminal commit (claim is 1st)
-    usecase = CreatePayment(uow, processor, FakeClock(T0), FakeIdGen(), Config())
+    driver = DrivePayment(uow, processor)             # driver shares the uow -> its commit is the 2nd
+    usecase = CreatePayment(uow, driver, FakeClock(T0), FakeIdGen(), Config())
 
     result = usecase.execute(an_input(key="abc"))
 

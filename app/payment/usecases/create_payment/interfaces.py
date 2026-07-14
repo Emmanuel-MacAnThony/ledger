@@ -9,20 +9,19 @@ from typing import Protocol
 
 from app.payment.domain.entities.idempotency_key import IdempotencyKey
 from app.payment.domain.entities.payment import Payment
-from app.payment.domain.states import ChargeOutcome, ClaimOutcome, KeyState, PaymentStatus
+from app.payment.domain.states import ClaimOutcome
+from app.payment.usecases.drive_payment.dtos import DrivePaymentInput, DriveResult
 
 
 class KeysRepo(Protocol):
     def get(self, key: str) -> IdempotencyKey | None: ...
     def insert(self, key: IdempotencyKey) -> ClaimOutcome: ...   # WON | LOST (the lock)
     def reset(self, key: IdempotencyKey) -> None: ...            # reclaim: overwrite existing row
-    def set_terminal(self, key: str, state: KeyState) -> None: ...
 
 
 class PaymentsRepo(Protocol):
     def get(self, payment_id: str) -> Payment: ...
     def insert_pending(self, payment: Payment) -> None: ...
-    def set_status(self, payment_id: str, status: PaymentStatus) -> None: ...
 
 
 class UnitOfWork(Protocol):
@@ -35,9 +34,9 @@ class UnitOfWork(Protocol):
     def rollback(self) -> None: ...
 
 
-class ProcessorClient(Protocol):
-    def charge(self, processor_key: str, amount: int, currency: str,
-               user_id: str) -> ChargeOutcome: ...
+class PaymentDriver(Protocol):
+    # charge + atomic terminal; create_payment maps its neutral DriveResult.
+    def execute(self, inp: DrivePaymentInput) -> DriveResult: ...
 
 
 class Clock(Protocol):
