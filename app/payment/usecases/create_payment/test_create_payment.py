@@ -373,6 +373,82 @@ def test_expired_in_flight_key_is_not_reclaimed():
     assert store.keys["abc"].state == KeyState.SUCCEEDED   # resolved, not recycled
 
 
+class _RacingKeys:
+    # Reproduces the TOCTOU race: get() sees nothing until we try to insert, at
+    # which point a concurrent winner has already claimed + settled the key.
+    def __init__(self, winner):
+        self._winner = winner
+        self._raced = False
+
+    def get(self, key):
+        return self._winner if self._raced else None
+
+    def insert(self, key):
+        self._raced = True
+        return ClaimOutcome.LOST      # the winner beat us to the UNIQUE insert
+
+    def reset(self, key):
+        pass
+
+
+class _RacingPayments:
+    def __init__(self, winner_payment):
+        self._winner = winner_payment
+        self.inserted = []
+
+    def get(self, payment_id):
+        return self._winner
+
+    def insert_pending(self, payment):
+        self.inserted.append(payment)
+
+    def set_status(self, payment_id, status):
+        pass
+
+
+class _RacingUoW:
+    def __init__(self, keys, payments):
+        self.keys = keys
+        self.payments = payments
+        self.commits = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def commit(self):
+        self.commits += 1
+
+
+def test_lost_claim_race_replays_winner_and_creates_no_second_payment():
+    # The concurrent winner already claimed AND settled key "abc".
+    winner_key = IdempotencyKey(
+        key="abc", state=KeyState.SUCCEEDED,
+        request_hash=fingerprint(1000, "USD", "user_1"),
+        payment_id="pay_win", created_at=T0, started_at=T0,
+    )
+    winner_payment = Payment(
+        id="pay_win", idempotency_key="abc", processor_key="pk_win",
+        amount=1000, currency="USD", user_id="user_1",
+        status=PaymentStatus.SUCCEEDED, created_at=T0,
+    )
+    payments = _RacingPayments(winner_payment)
+    uow = _RacingUoW(_RacingKeys(winner_key), payments)
+    processor = FakeProcessor(ChargeOutcome.SUCCESS)   # must NOT be called
+    usecase = CreatePayment(uow, DrivePayment(uow, processor),
+                            FakeClock(T0), FakeIdGen(), Config())
+
+    result = usecase.execute(an_input(key="abc"))       # same body as the winner
+
+    assert result.is_ok
+    assert result.value.payment_id == "pay_win"         # replayed the winner
+    assert payments.inserted == []                      # NO second payment created
+    assert uow.commits == 0                             # nothing committed on the lost path
+    assert processor.calls == 0                         # NO second charge
+
+
 def test_terminal_write_failure_returns_internal_and_leaves_in_flight():
     store = Store()
     processor = FakeProcessor(ChargeOutcome.SUCCESS)

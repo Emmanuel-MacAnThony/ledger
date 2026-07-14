@@ -2,7 +2,7 @@ from app.config import Config
 from app.payment.domain.entities.idempotency_key import IdempotencyKey
 from app.payment.domain.entities.payment import Payment
 from app.payment.domain.fingerprint import fingerprint
-from app.payment.domain.states import KeyState, PaymentStatus
+from app.payment.domain.states import ClaimOutcome, KeyState, PaymentStatus
 from app.payment.usecases.create_payment.dtos import CreatePaymentInput, PaymentResult
 from app.payment.usecases.drive_payment.dtos import DriveOutcome, DrivePaymentInput
 from app.payment.usecases.create_payment.errors import (
@@ -81,13 +81,22 @@ class CreatePayment:
 
         # Beat 1 — claim: fresh key(IN_FLIGHT) + payment(PENDING), atomically.
         # reclaim overwrites an expired key row; new inserts a fresh one (unique-guarded).
+        lost = False
         with self._uow as uow:
             if reclaim:
                 uow.keys.reset(key)
-            else:
-                uow.keys.insert(key)
-            uow.payments.insert_pending(payment)
-            uow.commit()
+            elif uow.keys.insert(key) is ClaimOutcome.LOST:
+                lost = True                      # a concurrent request claimed it first
+            if not lost:
+                uow.payments.insert_pending(payment)
+                uow.commit()
+
+        if lost:
+            # We lost the claim race: get() saw nothing, but insert hit the UNIQUE
+            # constraint. Nothing was committed — re-read and handle the now-existing
+            # key (replay / come-back) instead of creating a duplicate payment + charge.
+            existing = self._uow.keys.get(inp.idempotency_key)
+            return self._handle_existing(existing, inp, request_hash, now)
 
         # Beats 2 & 3 — charge + terminal.
         return self._drive(inp.idempotency_key, payment)
